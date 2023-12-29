@@ -4,6 +4,9 @@ from typing import Callable, List, Dict, Optional, Type
 from functools import lru_cache, partial
 import traceback
 
+import pandas as pd
+from pathlib import Path
+
 import numpy as np
 from pandas import DataFrame, Series
 import plotly.graph_objects as go
@@ -80,6 +83,7 @@ class BacktestingEngine:
 
         self.daily_results: Dict[date, DailyResult] = {}
         self.daily_df: DataFrame = None
+
 
     def clear_data(self) -> None:
         """
@@ -212,22 +216,23 @@ class BacktestingEngine:
         # Use the first [days] of history data for initializing strategy
         day_count: int = 0
         ix: int = 0
+        # 如果days > 0 才需要做初始化，因为有些策略运行前不需要做历史数据，也就没有调用load_bar。 by LongSheng
+        if self.days > 0:
+            for ix, data in enumerate(self.history_data):
+                if self.datetime and data.datetime.day != self.datetime.day:
+                    day_count += 1
+                    if day_count >= self.days:
+                        break
 
-        for ix, data in enumerate(self.history_data):
-            if self.datetime and data.datetime.day != self.datetime.day:
-                day_count += 1
-                if day_count >= self.days:
-                    break
+                self.datetime = data.datetime
 
-            self.datetime = data.datetime
-
-            try:
-                self.callback(data)
-            except Exception:
-                self.output("触发异常，回测终止")
-                self.output(traceback.format_exc())
-                return
-
+                try:
+                    self.callback(data)
+                except Exception:
+                    self.output("触发异常，回测终止")
+                    self.output(traceback.format_exc())
+                    return
+        
         self.strategy.inited = True
         self.output("策略初始化完成")
 
@@ -669,9 +674,11 @@ class BacktestingEngine:
 
             if long_cross:
                 trade_price = min(order.price, long_best_price)
+                #trade_price = order.price
                 pos_change = order.volume
             else:
                 trade_price = max(order.price, short_best_price)
+                #trade_price = order.price
                 pos_change = -order.volume
 
             trade: TradeData = TradeData(
@@ -978,6 +985,8 @@ class BacktestingEngine:
         """
         return list(self.daily_results.values())
 
+        
+    
 
 class DailyResult:
     """"""
@@ -1053,6 +1062,118 @@ class DailyResult:
         self.net_pnl = self.total_pnl - self.commission - self.slippage
 
 
+# add by longsheng
+@lru_cache(maxsize=999)
+def read_bar_data_from_csv(symbol: str, exchange: str) -> pd.DataFrame:
+    """从文件夹中读取指定symbol的bar数据"""
+    try:
+        # 找出symbol对应的1分钟bar数据文件
+        root_path = Path('C:\\Users\\lijie\\Downloads\\1分钟bar')
+        matching_files = []
+        # 暂时不用exchange过滤，因为在ib的A股数据，交易所叫法不同
+        keyword_list = [symbol, exchange, 'midpoint-1min']
+        keyword_list = [symbol, 'midpoint-1min']
+
+        # 遍历文件夹及其子文件夹
+        for file_path in root_path.glob('**/*'):
+            if file_path.is_file():
+                match = True
+                for keyword in keyword_list:
+                    if keyword not in file_path.name:
+                        match = False
+                        break
+                if match:
+                    matching_files.append(file_path)
+        
+        # 把指定目录下的多个excel文件，全部读取出来，然后合并成一个DataFrame
+        df = pd.DataFrame()
+        for file in matching_files:
+            # 可以添加过滤条件，只读取指定symbol的文件
+            df = pd.concat([df, pd.read_csv(file)], ignore_index=True)
+        
+        # 重命名列名
+        new_columns = ['datetime', 'open_price', 'high_price', 'low_price', 'close_price', 'volume', 'wap', 'barcount']
+        df.columns = new_columns
+        # 字符串转换为时间格式
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        
+        # 正序排列
+        df.sort_values(by='datetime', inplace=True)
+        df.set_index('datetime', inplace=True)
+
+        return df
+    except Exception as e:
+        print("读取bar文件失败", e)
+        return None
+    
+
+# add by longsheng
+@lru_cache(maxsize=999)
+def read_bar_data_from_excel(symbol: str, exchange: str) -> pd.DataFrame:
+    """从文件夹中读取指定symbol的bar数据"""
+    try:
+        # 读取文件夹下的所有文件名, 用pathlib库
+        dir_path = Path('C:\\Users\\lijie\\Downloads\\年度数据(分红)')
+        file_list = [x for x in dir_path.iterdir() if x.is_file()]
+        
+        # 把指定目录下的多个excel文件，全部读取出来，然后合并成一个DataFrame
+        df = pd.DataFrame()
+        for file in file_list:
+            # 可以添加过滤条件，只读取指定symbol的文件
+            df = pd.concat([df, pd.read_excel(file)], ignore_index=True)
+        
+        # 正序排列
+        df.sort_values(by='datetime', inplace=True)
+        df.set_index('datetime', inplace=True)
+
+        return df
+    except Exception as e:
+        print("读取bar文件失败", e)
+        return None
+
+# add by longsheng
+@lru_cache(maxsize=999)
+def load_bar_data_from_file(
+    symbol: str,
+    exchange: Exchange,
+    interval: Interval,
+    start: datetime,
+    end: datetime
+) -> List[BarData]:
+    
+    result_bars = []
+
+    df_bar_data = read_bar_data_from_csv(symbol, exchange.value)
+    if df_bar_data is None:
+        return result_bars
+    
+    try:
+        # 选取指定时间段的数据
+        df = df_bar_data.loc[start:end]
+
+        # 把DataFrame转换成BarData的列表   
+        for index, row in df.iterrows():
+            bar = BarData(
+                symbol=symbol,
+                exchange=exchange,
+                datetime=index,
+                interval=interval,
+                volume=row['volume'],
+                turnover=0,
+                open_interest=0,
+                open_price=row['open_price'],
+                high_price=row['high_price'],
+                low_price=row['low_price'],
+                close_price=row['close_price'],            
+                gateway_name='DB',
+            )
+            result_bars.append(bar)
+    except Exception as e:
+        print("从文件加载bar失败", e)
+    
+    return result_bars
+
+
 @lru_cache(maxsize=999)
 def load_bar_data(
     symbol: str,
@@ -1064,10 +1185,17 @@ def load_bar_data(
     """"""
     database: BaseDatabase = get_database()
 
-    return database.load_bar_data(
+    # modified by longsheng。如果数据中没有数据，则从指定文件中读取bar数据
+    result_bars = database.load_bar_data(
         symbol, exchange, interval, start, end
     )
 
+    if result_bars is None or len(result_bars) == 0:
+        result_bars = load_bar_data_from_file(
+            symbol, exchange, interval, start, end
+        )
+    
+    return result_bars
 
 @lru_cache(maxsize=999)
 def load_tick_data(
